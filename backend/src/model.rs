@@ -352,45 +352,6 @@ pub fn route_view(elem: &BgpElem) -> RouteView {
     }
 }
 
-pub fn route_entry(
-    elem: &BgpElem,
-    peer_key: &str,
-    first_seen: f64,
-    updated_at: f64,
-    updates: u64,
-) -> RouteEntry {
-    let as_path = elem.as_path.as_ref();
-    RouteEntry {
-        prefix: elem.prefix.to_string(),
-        path_id: elem.prefix.path_id,
-        peer_key: peer_key.to_string(),
-        peer_ip: elem.peer_ip.to_string(),
-        peer_asn: elem.peer_asn.to_u32(),
-        next_hop: elem.next_hop.map(|ip| ip.to_string()),
-        as_path: as_path.map(flatten_as_path).unwrap_or_default(),
-        as_path_str: as_path.map(|p| p.to_string()).unwrap_or_default(),
-        origin_asns: elem
-            .origin_asns
-            .as_ref()
-            .map(|asns| asns.iter().map(|a| a.to_u32()).collect())
-            .unwrap_or_default(),
-        origin: elem
-            .origin
-            .as_ref()
-            .map(|origin| origin.to_string().to_ascii_lowercase()),
-        med: elem.med,
-        local_pref: elem.local_pref,
-        communities: elem
-            .communities
-            .as_ref()
-            .map(|cs| cs.iter().map(|c| c.to_string()).collect())
-            .unwrap_or_default(),
-        first_seen,
-        updated_at,
-        updates,
-    }
-}
-
 pub fn open_info(msg: &BgpMessage) -> Option<OpenInfo> {
     let BgpMessage::Open(open) = msg else {
         return None;

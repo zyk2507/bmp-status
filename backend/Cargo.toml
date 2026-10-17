@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"
+ahash = "0.8"
 axum = { version = "0.8", features = ["ws"] }
 bgpkit-parser = { version = "0.22", default-features = false, features = ["parser"] }
 bytes = "1"

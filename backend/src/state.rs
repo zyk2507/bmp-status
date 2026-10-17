@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use ahash::{AHashMap, AHashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -123,6 +125,95 @@ struct InstanceActivity {
 
 struct PeerState {
     view: PeerView,
+    route_peer: Arc<RoutePeer>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct RoutePeer {
+    key: Arc<str>,
+    ip: Arc<str>,
+    asn: u32,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct RouteKey {
+    peer: Arc<RoutePeer>,
+    prefix: Arc<str>,
+    path_id: Option<u32>,
+}
+
+struct RouteRecord {
+    next_hop: Option<Arc<str>>,
+    as_path: Arc<[u32]>,
+    as_path_str: Arc<str>,
+    origin_asns: Arc<[u32]>,
+    origin: Option<Arc<str>>,
+    med: Option<u32>,
+    local_pref: Option<u32>,
+    communities: Arc<[Arc<str>]>,
+    first_seen: f64,
+    updated_at: f64,
+    updates: u64,
+    order_key: (u64, u64),
+}
+
+#[derive(Default)]
+struct StringInterner {
+    values: AHashSet<Arc<str>>,
+}
+
+impl StringInterner {
+    fn intern(&mut self, value: &str) -> Arc<str> {
+        // The interner is an optimization cache, not route storage. Bound it
+        // so pathological churn cannot retain an unbounded set of values.
+        if self.values.len() >= 262_144 {
+            self.values.clear();
+        }
+        if let Some(existing) = self.values.get(value) {
+            return existing.clone();
+        }
+        let interned: Arc<str> = Arc::from(value);
+        self.values.insert(interned.clone());
+        interned
+    }
+}
+
+#[derive(Default)]
+struct U32Interner {
+    values: AHashSet<Arc<[u32]>>,
+}
+
+impl U32Interner {
+    fn intern(&mut self, values: &[u32]) -> Arc<[u32]> {
+        if self.values.len() >= 262_144 {
+            self.values.clear();
+        }
+        if let Some(existing) = self.values.get(values) {
+            return existing.clone();
+        }
+        let interned: Arc<[u32]> = Arc::from(values);
+        self.values.insert(interned.clone());
+        interned
+    }
+}
+
+#[derive(Default)]
+struct CommunityInterner {
+    values: AHashSet<Arc<[Arc<str>]>>,
+}
+
+impl CommunityInterner {
+    fn intern(&mut self, values: Vec<Arc<str>>) -> Arc<[Arc<str>]> {
+        if self.values.len() >= 65_536 {
+            self.values.clear();
+        }
+        if let Some(existing) = self.values.get(values.as_slice()) {
+            return existing.clone();
+        }
+        let interned: Arc<[Arc<str>]> = Arc::from(values);
+        self.values.insert(interned.clone());
+        interned
+    }
 }
 
 #[derive(Default)]
@@ -133,11 +224,16 @@ struct Inner {
     totals: Totals,
     messages: VecDeque<Arc<MessageView>>,
     peers: HashMap<String, PeerState>,
-    routes: HashMap<(String, String), RouteEntry>,
-    route_order: VecDeque<(String, String)>,
+    routes: AHashMap<RouteKey, RouteRecord>,
+    /// Newest-update order. Values are active route keys only.
+    route_order: BTreeMap<(u64, u64), RouteKey>,
+    next_route_seq: u64,
     limits: RuntimeConfig,
+    string_interner: StringInterner,
+    u32_interner: U32Interner,
+    community_interner: CommunityInterner,
     buckets: BTreeMap<u64, BucketCounts>,
-    top_origins: HashMap<u32, u64>,
+    top_origins: AHashMap<u32, u64>,
     instance_activity: HashMap<String, InstanceActivity>,
     connections: HashMap<u64, ConnectionView>,
     closed_connections: VecDeque<ConnectionView>,
@@ -192,13 +288,7 @@ impl AppState {
     pub fn update_runtime_config(&self, next: RuntimeConfig) -> anyhow::Result<RuntimeConfig> {
         let next = self.runtime.update(next)?;
         let mut inner = self.lock_inner();
-        let previous = inner.limits;
         inner.limits = next;
-        if next.max_routes == 0 {
-            inner.route_order.clear();
-        } else if previous.max_routes == 0 || inner.route_order.is_empty() {
-            rebuild_route_order(&mut inner);
-        }
         trim_state(&mut inner);
         drop(inner);
         self.broadcast_overview();
@@ -527,57 +617,90 @@ impl AppState {
         let needle = q
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty());
-        let peer_filter = peer.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let router_filter = router
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let peer_filter = peer.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let peer_asn_filter = peer_filter.and_then(|value| value.parse::<u32>().ok());
+        let router_filter = router.map(|s| s.trim()).filter(|s| !s.is_empty());
         let limit = limit.max(1);
+        let requested_page = page.max(1);
+        let start = (requested_page - 1) * limit;
         let inner = self.lock_inner();
-        let mut routes: Vec<RouteEntry> = inner
-            .routes
-            .values()
-            .filter(|r| {
-                needle
-                    .as_deref()
-                    .map(|n| route_matches(r, n))
-                    .unwrap_or(true)
-            })
-            .filter(|r| {
-                peer_filter
-                    .as_deref()
-                    .map(|p| r.peer_ip == p || r.peer_asn.to_string() == p || r.peer_key == p)
-                    .unwrap_or(true)
-            })
-            .filter(|r| {
-                router_filter
-                    .as_deref()
-                    .map(|router_ip| {
-                        inner
-                            .peers
-                            .get(&r.peer_key)
-                            .and_then(|p| p.view.router.as_deref())
-                            == Some(router_ip)
-                    })
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-        routes.sort_by(|a, b| {
-            b.updated_at
-                .partial_cmp(&a.updated_at)
-                .unwrap_or(Ordering::Equal)
-        });
-        let total = routes.len();
-        let total_pages = total.div_ceil(limit).max(1);
-        let page = page.max(1).min(total_pages);
-        let start = (page - 1) * limit;
-        let end = (start + limit).min(total);
-        let returned = end.saturating_sub(start);
-        routes = if start < total {
-            routes[start..end].to_vec()
-        } else {
-            Vec::new()
+
+        let matches = |key: &RouteKey, record: &RouteRecord| {
+            route_matches_filters(
+                &inner,
+                key,
+                record,
+                needle.as_deref(),
+                peer_filter,
+                peer_asn_filter,
+                router_filter,
+            )
         };
+
+        let no_filter = needle.is_none() && peer_filter.is_none() && router_filter.is_none();
+        let mut total = if no_filter { inner.routes.len() } else { 0 };
+        let mut routes: Vec<RouteEntry> = Vec::with_capacity(limit);
+
+        if no_filter {
+            for key in inner.route_order.values().rev().skip(start).take(limit) {
+                if let Some(record) = inner.routes.get(key) {
+                    routes.push(to_route_entry(key, record));
+                }
+            }
+        } else {
+            // A filtered/search query must visit all active records to produce
+            // the correct total count. It does not allocate or sort the whole
+            // RIB; only the requested page is materialized.
+            for key in inner.route_order.values().rev() {
+                let Some(record) = inner.routes.get(key) else {
+                    continue;
+                };
+                if matches(key, record) {
+                    if total >= start && routes.len() < limit {
+                        routes.push(to_route_entry(key, record));
+                    }
+                    total += 1;
+                }
+            }
+        }
+
+        let total_pages = total.div_ceil(limit).max(1);
+        let page = requested_page.min(total_pages);
+
+        // If the requested page was beyond the end, re-scan for the clamped
+        // last page. This path is rare and avoids retaining all matches.
+        if page != requested_page {
+            let page_start = (page - 1) * limit;
+            routes.clear();
+            if no_filter {
+                for key in inner
+                    .route_order
+                    .values()
+                    .rev()
+                    .skip(page_start)
+                    .take(limit)
+                {
+                    if let Some(record) = inner.routes.get(key) {
+                        routes.push(to_route_entry(key, record));
+                    }
+                }
+            } else {
+                let mut seen = 0usize;
+                for key in inner.route_order.values().rev() {
+                    let Some(record) = inner.routes.get(key) else {
+                        continue;
+                    };
+                    if matches(key, record) {
+                        if seen >= page_start && routes.len() < limit {
+                            routes.push(to_route_entry(key, record));
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+        }
+
+        let returned = routes.len();
         RoutesResponse {
             total,
             returned,
@@ -809,23 +932,96 @@ fn message_matches(m: &MessageView, needle: &str) -> bool {
     false
 }
 
-fn route_matches(r: &RouteEntry, needle: &str) -> bool {
-    r.prefix.to_ascii_lowercase().contains(needle)
-        || r.as_path_str.to_ascii_lowercase().contains(needle)
-        || r.peer_ip.contains(needle)
-        || r.peer_asn.to_string().contains(needle)
-        || r.origin_asns.iter().any(|a| a.to_string().contains(needle))
-        || r.origin
+fn route_matches_text(key: &RouteKey, record: &RouteRecord, needle: &str) -> bool {
+    key.prefix.contains(needle)
+        || record.as_path_str.contains(needle)
+        || key.peer.ip.contains(needle)
+        || key.peer.asn.to_string().contains(needle)
+        || record
+            .origin_asns
+            .iter()
+            .any(|a| a.to_string().contains(needle))
+        || record
+            .origin
             .as_deref()
-            .map(|o| o.to_ascii_lowercase().contains(needle))
+            .map(|o| o.contains(needle))
             .unwrap_or(false)
-        || r.communities
+        || record
+            .communities
             .iter()
             .any(|c| c.to_ascii_lowercase().contains(needle))
-        || r.next_hop
+        || record
+            .next_hop
             .as_deref()
             .map(|n| n.contains(needle))
             .unwrap_or(false)
+}
+
+fn route_matches_filters(
+    inner: &Inner,
+    key: &RouteKey,
+    record: &RouteRecord,
+    needle: Option<&str>,
+    peer: Option<&str>,
+    peer_asn: Option<u32>,
+    router: Option<&str>,
+) -> bool {
+    if let Some(peer_filter) = peer {
+        if key.peer.ip.as_ref() != peer_filter
+            && key.peer.key.as_ref() != peer_filter
+            && peer_asn != Some(key.peer.asn)
+        {
+            return false;
+        }
+    }
+    if let Some(router_filter) = router {
+        let matches_router = inner
+            .peers
+            .get(key.peer.key.as_ref())
+            .and_then(|p| p.view.router.as_deref())
+            == Some(router_filter);
+        if !matches_router {
+            return false;
+        }
+    }
+    if let Some(needle) = needle {
+        return route_matches_text(key, record, needle);
+    }
+    true
+}
+
+fn to_route_entry(key: &RouteKey, record: &RouteRecord) -> RouteEntry {
+    RouteEntry {
+        prefix: key.prefix.to_string(),
+        path_id: key.path_id,
+        peer_key: key.peer.key.to_string(),
+        peer_ip: key.peer.ip.to_string(),
+        peer_asn: key.peer.asn,
+        next_hop: record.next_hop.as_deref().map(str::to_string),
+        as_path: record.as_path.to_vec(),
+        as_path_str: record.as_path_str.to_string(),
+        origin_asns: record.origin_asns.to_vec(),
+        origin: record.origin.as_deref().map(str::to_string),
+        med: record.med,
+        local_pref: record.local_pref,
+        communities: record
+            .communities
+            .iter()
+            .map(|community| community.to_string())
+            .collect(),
+        first_seen: record.first_seen,
+        updated_at: record.updated_at,
+        updates: record.updates,
+    }
+}
+
+fn route_order_key(updated_at: f64, seq: u64) -> (u64, u64) {
+    let micros = if updated_at.is_finite() && updated_at > 0.0 {
+        (updated_at * 1_000_000.0).min(u64::MAX as f64) as u64
+    } else {
+        0
+    };
+    (micros, seq)
 }
 
 fn decrement_peer_prefix(inner: &mut Inner, peer_key: &str) {
@@ -834,20 +1030,128 @@ fn decrement_peer_prefix(inner: &mut Inner, peer_key: &str) {
     }
 }
 
-fn rebuild_route_order(inner: &mut Inner) {
-    inner.route_order.clear();
-    if inner.limits.max_routes == 0 {
-        return;
-    }
-    let mut entries: Vec<(f64, (String, String))> = inner
+fn remove_route(inner: &mut Inner, key: &RouteKey) -> bool {
+    let Some(record) = inner.routes.remove(key) else {
+        return false;
+    };
+    inner.route_order.remove(&record.order_key);
+    decrement_peer_prefix(inner, key.peer.key.as_ref());
+    true
+}
+
+fn remove_peer_routes(inner: &mut Inner, peer_key: &str) {
+    let keys: Vec<RouteKey> = inner
         .routes
-        .iter()
-        .map(|(key, route)| (route.first_seen, key.clone()))
+        .keys()
+        .filter(|key| key.peer.key.as_ref() == peer_key)
+        .cloned()
         .collect();
-    entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-    inner
-        .route_order
-        .extend(entries.into_iter().map(|(_, key)| key));
+    for key in keys {
+        remove_route(inner, &key);
+    }
+    if let Some(peer) = inner.peers.get_mut(peer_key) {
+        peer.view.prefixes = 0;
+    }
+}
+
+fn make_route_record(
+    inner: &mut Inner,
+    elem: &BgpElem,
+    first_seen: f64,
+    updated_at: f64,
+    updates: u64,
+) -> RouteRecord {
+    let as_path_vec = elem
+        .as_path
+        .as_ref()
+        .map(flatten_as_path)
+        .unwrap_or_default();
+    let as_path: Arc<[u32]> = inner.u32_interner.intern(&as_path_vec);
+
+    let as_path_str: Arc<str> = elem
+        .as_path
+        .as_ref()
+        .map(|path| inner.string_interner.intern(&path.to_string()))
+        .unwrap_or_else(|| inner.string_interner.intern(""));
+
+    let origin_asns_vec: Vec<u32> = elem
+        .origin_asns
+        .as_ref()
+        .map(|asns| asns.iter().map(|a| a.to_u32()).collect())
+        .unwrap_or_default();
+    let origin_asns: Arc<[u32]> = inner.u32_interner.intern(&origin_asns_vec);
+
+    let origin = elem.origin.as_ref().map(|origin| {
+        inner
+            .string_interner
+            .intern(&origin.to_string().to_ascii_lowercase())
+    });
+
+    let next_hop = elem
+        .next_hop
+        .map(|ip| inner.string_interner.intern(&ip.to_string()));
+
+    let mut community_list: Vec<Arc<str>> = Vec::new();
+    if let Some(communities) = &elem.communities {
+        community_list.reserve(communities.len());
+        for community in communities {
+            let value = community.to_string();
+            community_list.push(inner.string_interner.intern(&value));
+        }
+    }
+    let communities = inner.community_interner.intern(community_list);
+
+    RouteRecord {
+        next_hop,
+        as_path,
+        as_path_str,
+        origin_asns,
+        origin,
+        med: elem.med,
+        local_pref: elem.local_pref,
+        communities,
+        first_seen,
+        updated_at,
+        updates,
+        order_key: (0, 0),
+    }
+}
+
+fn apply_rib_update(inner: &mut Inner, peer: Arc<RoutePeer>, elem: &BgpElem, ts: f64) {
+    let prefix: Arc<str> = Arc::from(elem.prefix.to_string());
+    let key = RouteKey {
+        peer,
+        prefix,
+        path_id: elem.prefix.path_id,
+    };
+
+    if elem.elem_type == ElemType::ANNOUNCE {
+        let existing = inner.routes.get(&key);
+        let first_seen = existing.map(|e| e.first_seen).unwrap_or(ts);
+        let updates = existing.map(|e| e.updates + 1).unwrap_or(1);
+        let old_order = existing.map(|e| e.order_key);
+        let is_new = existing.is_none();
+
+        if let Some(order) = old_order {
+            inner.route_order.remove(&order);
+        }
+
+        inner.next_route_seq = inner.next_route_seq.wrapping_add(1);
+        let order_key = route_order_key(ts, inner.next_route_seq);
+        let mut record = make_route_record(inner, elem, first_seen, ts, updates);
+        record.order_key = order_key;
+
+        inner.routes.insert(key.clone(), record);
+        inner.route_order.insert(order_key, key.clone());
+        if is_new {
+            if let Some(peer) = inner.peers.get_mut(key.peer.key.as_ref()) {
+                peer.view.prefixes += 1;
+            }
+        }
+    } else if let Some(record) = inner.routes.remove(&key) {
+        inner.route_order.remove(&record.order_key);
+        decrement_peer_prefix(inner, key.peer.key.as_ref());
+    }
 }
 
 fn trim_state(inner: &mut Inner) {
@@ -859,24 +1163,12 @@ fn trim_state(inner: &mut Inner) {
         }
     }
 
-    if limits.max_routes == 0 {
-        inner.route_order.clear();
-    } else {
-        // Withdrawals leave lazy tombstones in route_order. Compact before the
-        // tombstone queue grows beyond a small bounded overhead.
-        if inner.route_order.len() > inner.routes.len().saturating_add(1_024) {
-            rebuild_route_order(inner);
-        }
-        if inner.route_order.is_empty() && !inner.routes.is_empty() {
-            rebuild_route_order(inner);
-        }
+    if limits.max_routes > 0 {
         while inner.routes.len() > limits.max_routes {
-            let Some(key) = inner.route_order.pop_front() else {
+            let Some((_, key)) = inner.route_order.pop_first() else {
                 break;
             };
-            if inner.routes.remove(&key).is_some() {
-                decrement_peer_prefix(inner, &key.0);
-            }
+            remove_route(inner, &key);
         }
     }
 
@@ -895,58 +1187,17 @@ fn trim_state(inner: &mut Inner) {
             let Some(peer_key) = oldest else {
                 break;
             };
-            inner.routes.retain(|(pk, _), _| pk != &peer_key);
+            remove_peer_routes(inner, &peer_key);
             inner.peers.remove(&peer_key);
         }
     }
 
-    // Peer eviction removes routes; enforce the route cap afterwards if both
-    // limits are active.
-    if limits.max_routes > 0 && inner.routes.len() > limits.max_routes {
-        rebuild_route_order(inner);
-        while inner.routes.len() > limits.max_routes {
-            let Some(key) = inner.route_order.pop_front() else {
-                break;
-            };
-            if inner.routes.remove(&key).is_some() {
-                decrement_peer_prefix(inner, &key.0);
-            }
-        }
-    }
-}
-
-fn apply_rib_update(inner: &mut Inner, peer_key: &str, elem: &BgpElem, ts: f64) {
-    let prefix_key = match elem.prefix.path_id {
-        Some(id) => format!("{}#{}", elem.prefix, id),
-        None => elem.prefix.to_string(),
-    };
-    let key = (peer_key.to_string(), prefix_key);
-    if elem.elem_type == ElemType::ANNOUNCE {
-        let existing = inner.routes.get(&key);
-        let first_seen = existing.map(|e| e.first_seen).unwrap_or(ts);
-        let updates = existing.map(|e| e.updates + 1).unwrap_or(1);
-        let entry = route_entry(elem, peer_key, first_seen, ts, updates);
-        let is_new = existing.is_none();
-        inner.routes.insert(key.clone(), entry);
-        if is_new {
-            if inner.limits.max_routes > 0 {
-                inner.route_order.push_back(key.clone());
-            }
-            if let Some(peer) = inner.peers.get_mut(peer_key) {
-                peer.view.prefixes += 1;
-            }
-        }
-    } else if inner.routes.remove(&key).is_some() {
-        if let Some(peer) = inner.peers.get_mut(peer_key) {
-            peer.view.prefixes = peer.view.prefixes.saturating_sub(1);
-        }
-    }
-}
-
-fn remove_peer_routes(inner: &mut Inner, peer_key: &str) {
-    inner.routes.retain(|(pk, _), _| pk != peer_key);
-    if let Some(peer) = inner.peers.get_mut(peer_key) {
-        peer.view.prefixes = 0;
+    // HashMap keeps its high-water capacity after mass withdrawals/evictions.
+    // Release that memory when the active RIB has shrunk substantially.
+    if inner.routes.capacity() > 8_192
+        && inner.routes.len().saturating_mul(4) < inner.routes.capacity()
+    {
+        inner.routes.shrink_to_fit();
     }
 }
 
@@ -998,17 +1249,27 @@ fn build_message(
 
     // Per-peer header common to most BMP message types.
     let mut peer_key_val: Option<String> = None;
+    let mut peer_meta_val: Option<Arc<RoutePeer>> = None;
     if let Some(h) = &msg.per_peer_header {
         let ts = if h.timestamp > 0.0 { h.timestamp } else { now };
         view.ts = ts;
         let key = peer_key(h);
-        let peer = inner.peers.entry(key.clone()).or_insert_with(|| PeerState {
-            view: peer_view_from_header(h, now),
+        let peer = inner.peers.entry(key.clone()).or_insert_with(|| {
+            let route_peer = Arc::new(RoutePeer {
+                key: Arc::from(key.as_str()),
+                ip: Arc::from(h.peer_ip.to_string()),
+                asn: h.peer_asn.to_u32(),
+            });
+            PeerState {
+                view: peer_view_from_header(h, now),
+                route_peer,
+            }
         });
         peer.view.router = Some(router_ip.to_string());
         peer.view.last_seen = peer.view.last_seen.max(ts);
         peer.view.messages += 1;
         view.peer = Some(peer_ref_from_view(&peer.view));
+        peer_meta_val = Some(peer.route_peer.clone());
         peer_key_val = Some(key);
     }
 
@@ -1016,16 +1277,20 @@ fn build_message(
         BmpMessageBody::RouteMonitoring(rm) => {
             inner.totals.route_monitoring += 1;
             let peer_header = msg.per_peer_header;
-            match &rm.bgp_message {
+            let end_of_rib = rm.is_end_of_rib();
+            // Consume the UPDATE instead of cloning it. A large BMP UPDATE may
+            // carry thousands of prefixes, so this avoids a second deep copy
+            // of the BGP payload on the ingest hot path.
+            match rm.bgp_message {
                 BgpMessage::Update(update) => {
-                    view.bgp_type = Some(if rm.is_end_of_rib() {
+                    view.bgp_type = Some(if end_of_rib {
                         "UPDATE · End-of-RIB".to_string()
                     } else {
                         "UPDATE".to_string()
                     });
-                    if let (Some(h), Some(pk)) = (peer_header, peer_key_val.as_deref()) {
+                    if let (Some(h), Some(peer_meta)) = (peer_header, peer_meta_val.as_ref()) {
                         let elems = Elementor::bgp_update_to_elems(
-                            update.clone(),
+                            update,
                             view.ts,
                             &h.peer_ip,
                             &h.peer_asn,
@@ -1047,21 +1312,21 @@ fn build_message(
                             if view.routes.len() < MAX_ROUTE_VIEWS {
                                 view.routes.push(route_view(elem));
                             }
-                            apply_rib_update(inner, pk, elem, view.ts);
+                            apply_rib_update(inner, peer_meta.clone(), elem, view.ts);
                         }
                         view.announced = announced;
                         view.withdrawn = withdrawn;
                         view.routes_truncated = view.routes_total.saturating_sub(view.routes.len());
                         inner.totals.announcements += announced as u64;
                         inner.totals.withdrawals += withdrawn as u64;
-                        if let Some(peer) = inner.peers.get_mut(pk) {
+                        if let Some(peer) = inner.peers.get_mut(peer_meta.key.as_ref()) {
                             peer.view.announcements += announced as u64;
                             peer.view.withdrawals += withdrawn as u64;
                         }
                     }
                 }
                 other => {
-                    view.bgp_type = Some(bgp_type_name(other).to_string());
+                    view.bgp_type = Some(bgp_type_name(&other).to_string());
                 }
             }
         }
