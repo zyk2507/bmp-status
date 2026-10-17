@@ -154,6 +154,7 @@ struct RouteRecord {
     first_seen: f64,
     updated_at: f64,
     updates: u64,
+    first_seq: u64,
     order_key: (u64, u64),
 }
 
@@ -227,6 +228,8 @@ struct Inner {
     routes: AHashMap<RouteKey, RouteRecord>,
     /// Newest-update order. Values are active route keys only.
     route_order: BTreeMap<(u64, u64), RouteKey>,
+    /// Creation order used only when max_routes is configured.
+    cap_order: BTreeMap<u64, RouteKey>,
     next_route_seq: u64,
     limits: RuntimeConfig,
     string_interner: StringInterner,
@@ -288,7 +291,13 @@ impl AppState {
     pub fn update_runtime_config(&self, next: RuntimeConfig) -> anyhow::Result<RuntimeConfig> {
         let next = self.runtime.update(next)?;
         let mut inner = self.lock_inner();
+        let previous = inner.limits;
         inner.limits = next;
+        if next.max_routes == 0 {
+            inner.cap_order.clear();
+        } else if previous.max_routes == 0 || inner.cap_order.is_empty() {
+            rebuild_cap_order(&mut inner);
+        }
         trim_state(&mut inner);
         drop(inner);
         self.broadcast_overview();
@@ -1035,6 +1044,7 @@ fn remove_route(inner: &mut Inner, key: &RouteKey) -> bool {
         return false;
     };
     inner.route_order.remove(&record.order_key);
+    inner.cap_order.remove(&record.first_seq);
     decrement_peer_prefix(inner, key.peer.key.as_ref());
     true
 }
@@ -1113,6 +1123,7 @@ fn make_route_record(
         first_seen,
         updated_at,
         updates,
+        first_seq: 0,
         order_key: (0, 0),
     }
 }
@@ -1130,6 +1141,7 @@ fn apply_rib_update(inner: &mut Inner, peer: Arc<RoutePeer>, elem: &BgpElem, ts:
         let first_seen = existing.map(|e| e.first_seen).unwrap_or(ts);
         let updates = existing.map(|e| e.updates + 1).unwrap_or(1);
         let old_order = existing.map(|e| e.order_key);
+        let existing_first_seq = existing.map(|e| e.first_seq);
         let is_new = existing.is_none();
 
         if let Some(order) = old_order {
@@ -1137,13 +1149,19 @@ fn apply_rib_update(inner: &mut Inner, peer: Arc<RoutePeer>, elem: &BgpElem, ts:
         }
 
         inner.next_route_seq = inner.next_route_seq.wrapping_add(1);
-        let order_key = route_order_key(ts, inner.next_route_seq);
+        let seq = inner.next_route_seq;
+        let order_key = route_order_key(ts, seq);
+        let first_seq = existing_first_seq.unwrap_or(seq);
         let mut record = make_route_record(inner, elem, first_seen, ts, updates);
         record.order_key = order_key;
+        record.first_seq = first_seq;
 
         inner.routes.insert(key.clone(), record);
         inner.route_order.insert(order_key, key.clone());
         if is_new {
+            if inner.limits.max_routes > 0 {
+                inner.cap_order.insert(first_seq, key.clone());
+            }
             if let Some(peer) = inner.peers.get_mut(key.peer.key.as_ref()) {
                 peer.view.prefixes += 1;
             }
@@ -1152,6 +1170,19 @@ fn apply_rib_update(inner: &mut Inner, peer: Arc<RoutePeer>, elem: &BgpElem, ts:
         inner.route_order.remove(&record.order_key);
         decrement_peer_prefix(inner, key.peer.key.as_ref());
     }
+}
+
+fn rebuild_cap_order(inner: &mut Inner) {
+    inner.cap_order.clear();
+    if inner.limits.max_routes == 0 {
+        return;
+    }
+    inner.cap_order.extend(
+        inner
+            .routes
+            .iter()
+            .map(|(key, record)| (record.first_seq, key.clone())),
+    );
 }
 
 fn trim_state(inner: &mut Inner) {
@@ -1164,8 +1195,11 @@ fn trim_state(inner: &mut Inner) {
     }
 
     if limits.max_routes > 0 {
+        if inner.cap_order.is_empty() && !inner.routes.is_empty() {
+            rebuild_cap_order(inner);
+        }
         while inner.routes.len() > limits.max_routes {
-            let Some((_, key)) = inner.route_order.pop_first() else {
+            let Some((_, key)) = inner.cap_order.pop_first() else {
                 break;
             };
             remove_route(inner, &key);
