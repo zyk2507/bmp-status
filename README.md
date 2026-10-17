@@ -382,9 +382,11 @@ BMP 解析出来的消息、peer 状态和活跃路由都保存在内存中；�
 - 路由内部使用紧凑的 `RouteRecord`，不再为每条路由立即构造完整的 JSON 视图；
 - 只有在 API 返回当前页时，才按页生成 50 条 `RouteEntry`；
 - peer 元数据、next-hop、origin、community 等低基数字符串使用 `Arc<str>` 和有限大小的 interner 共享；
+- AS path / origin ASN 数组也通过有限大小的 interner 复用，避免每个前缀重复分配；
 - 更新顺序使用 `BTreeMap` 索引，未筛选的路由页不需要排序或克隆整张 RIB；
 - 带搜索/peer/实例筛选时只做一次扫描并仅物化当前页，不创建全量临时 `Vec<RouteEntry>`；
 - 路由 HashMap 使用 `AHashMap`，mass withdrawal 后会按高水位/活跃数量比释放多余容量；
+- BMP UPDATE 在解析时直接 move，避免深拷贝整个 BGP payload；
 - 前端路由表仍然只保留当前页 50 条，浏览器不会加载整张 RIB。
 
 这些优化不改变公开 API 字段、路由筛选、搜索、分页、白名单或页面行为。
