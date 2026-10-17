@@ -1,0 +1,56 @@
+# BMP Status — systemd Quadlet 示例（rootful）
+#
+# 安装：
+#   sudo install -d /etc/containers/systemd /etc/bmp-status
+#   sudo cp docs/deploy/bmp-status.volume /etc/containers/systemd/
+#   sudo cp docs/deploy/bmp-status.container /etc/containers/systemd/
+#   sudo cp docs/deploy/bmp-status.env.example /etc/bmp-status/bmp-status.env
+#   sudo chmod 600 /etc/bmp-status/bmp-status.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl start bmp-status
+#
+# Quadlet 单元不要使用 systemctl enable；[Install] WantedBy=default.target
+# 由 Quadlet generator 处理，保留文件即可开机启动。
+#
+# Rootless 用户：把 .container/.volume 放到 ~/.config/containers/systemd/，
+# 把 EnvironmentFile 改成 ~/.config/bmp-status/bmp-status.env，然后使用
+# systemctl --user daemon-reload / start bmp-status，并开启 linger。
+
+[Unit]
+Description=BMP Status collector and dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=bmp-status
+Image=localhost/bmp-status:latest
+
+# host 网络保留 BMP 的真实源 IP，实例白名单才能按路由器地址匹配。
+# 桥接替代：Network=bridge + PublishPort=11019:11019 + PublishPort=8787:8787
+# （桥接时 BMP 源 IP 会变成 NAT 网关地址）。
+Network=host
+
+# 由 bmp-status.volume 单元创建的命名卷。
+Volume=bmp-status.volume:/var/lib/bmp-status
+
+EnvironmentFile=/etc/bmp-status/bmp-status.env
+ReadOnly=true
+Tmpfs=/tmp:rw,size=16m
+DropCapability=ALL
+NoNewPrivileges=true
+
+HealthCmd=wget -q -O /dev/null http://127.0.0.1:8787/api/health
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=10s
+
+# 仅当使用远端 registry 镜像并启用了 podman auto-update 时启用：
+# AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=default.target

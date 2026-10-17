@@ -1,0 +1,4 @@
+# Quadlet volume unit for BMP Status (see bmp-status.container).
+# The generated Podman volume is named bmp-status-data.
+[Volume]
+VolumeName=bmp-status-data

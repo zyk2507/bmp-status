@@ -1,0 +1,17 @@
+.git
+.gitignore
+.cache
+data
+data-*
+docs
+tests
+tools
+backend/target
+prebuilt-images
+.build.env
+frontend/node_modules
+frontend/.next
+frontend/AGENTS.md
+*.log
+.env
+.env.*

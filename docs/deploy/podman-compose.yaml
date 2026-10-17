@@ -1,0 +1,60 @@
+# BMP Status — Podman Compose 示例
+#
+# 推荐使用 host 网络：BMP 的来源 IP 会保持为真实路由器地址，
+# 这样管理员面板里的“实例白名单”才能正确匹配。
+#
+# 使用：
+#   cp docs/deploy/bmp-status.env.example docs/deploy/bmp-status.env
+#   chmod 600 docs/deploy/bmp-status.env
+#   cd docs/deploy
+#   # 推荐先 make cross-images（或执行 prebuilt-images/load.sh）
+#   podman compose -f podman-compose.yaml up -d
+#
+# 如果只想用桥接网络，把 network_mode 改成 bridge，取消 ports 注释，
+# 并注意 BMP 源 IP 会变成 NAT 网关地址（白名单将无法按真实路由器 IP 匹配）。
+
+name: bmp-status
+
+services:
+  bmp-status:
+    image: localhost/bmp-status:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-mirrors.cernet.edu.cn}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-mirrors.cernet.edu.cn}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-mirrors.cernet.edu.cn}
+    container_name: bmp-status
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ./bmp-status.env
+    volumes:
+      - bmp-status-data:/var/lib/bmp-status
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8787/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Bridge 网络替代方案（BMP 源 IP 会被 NAT，实例白名单会失效）：
+    # network_mode: bridge
+    # ports:
+    #   - "11019:11019/tcp"
+    #   - "8787:8787/tcp"
+
+volumes:
+  bmp-status-data:

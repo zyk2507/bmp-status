@@ -1,0 +1,32 @@
+# Minimal Alpine runtime used by the Makefile cross-image target.
+#
+# There are intentionally no RUN instructions in the final stage. This lets
+# Podman assemble an amd64 or arm64 image on either host architecture without
+# executing target-architecture binaries (and therefore without qemu).
+
+FROM alpine:3.22
+
+ARG BINARY=bin/bmp-status-linux-arm64-musl
+
+LABEL org.opencontainers.image.title="BMP Status" \
+      org.opencontainers.image.description="BMP (BGP Monitoring Protocol) collector and live dashboard" \
+      org.opencontainers.image.base.name="alpine:3.22"
+
+COPY --chmod=0755 ${BINARY} /usr/local/bin/bmp-status
+COPY --chown=10001:10001 container/data/.keep /var/lib/bmp-status/.keep
+
+ENV DATA_DIR=/var/lib/bmp-status \
+    BMP_BIND=0.0.0.0:11019 \
+    HTTP_BIND=0.0.0.0:8787 \
+    RUST_LOG=bmp_status=info
+
+VOLUME ["/var/lib/bmp-status"]
+EXPOSE 11019/tcp 8787/tcp
+STOPSIGNAL SIGTERM
+
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8787/api/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/bmp-status"]

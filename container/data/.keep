@@ -1,0 +1,4 @@
+# Placeholder that creates /var/lib/bmp-status with the runtime user's
+# ownership in images that do not execute RUN instructions. Keeping the
+# directory owned by 10001 also makes Podman named-volume copy-up work for
+# rootless deployments.
