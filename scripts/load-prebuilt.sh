@@ -51,6 +51,33 @@ for candidate in "${archives[@]}"; do
     fi
 done
 
+# Remove old images from this repository before importing the new archive.
+# Match only localhost/<image-name>, so unrelated images are never touched.
+# Force-remove both manifest lists and image tags; missing/in-use entries are
+# ignored so the loader can still proceed.
+mapfile -t OLD_REFS < <(
+    "${PODMAN}" "${PODMAN_ARGS[@]}" images \
+        --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | awk -v repo="localhost/${IMAGE_NAME}" -F: '$1 == repo { print $0 }' || true
+)
+if [[ ${#OLD_REFS[@]} -gt 0 ]]; then
+    echo "==> Removing old ${IMAGE_NAME} images..."
+    for old_ref in "${OLD_REFS[@]}"; do
+        [[ -n "$old_ref" ]] || continue
+        "${PODMAN}" "${PODMAN_ARGS[@]}" manifest rm "$old_ref" >/dev/null 2>&1 || true
+        if "${PODMAN}" "${PODMAN_ARGS[@]}" rmi -f "$old_ref" >/dev/null 2>&1; then
+            echo "    removed $old_ref"
+        else
+            echo "    skipped $old_ref (in use or already gone)" >&2
+        fi
+    done
+fi
+
+# Also remove unlabelled leftovers/layers from earlier BMP Status builds.
+# The label filter keeps unrelated dangling images untouched.
+"${PODMAN}" "${PODMAN_ARGS[@]}" image prune -f \
+    --filter "label=org.opencontainers.image.title=BMP Status" >/dev/null 2>&1 || true
+
 echo "==> Loading $archive"
 "${PODMAN}" "${PODMAN_ARGS[@]}" load -i "$archive"
 
