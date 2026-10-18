@@ -67,7 +67,7 @@ make all
 | `bin/bmp-status-linux-arm64-musl` | arm64 静态 musl 二进制 |
 | `prebuilt-images/bmp-status-<version>-linux-amd64.tar` | amd64 Docker 归档 |
 | `prebuilt-images/bmp-status-<version>-linux-arm64.tar` | arm64 Docker 归档 |
-| `prebuilt-images/load.sh` | 目标机器自动选择架构、加载并打 `latest` 标签 |
+| `prebuilt-images/load.sh` | 目标机器强制清理旧的 `localhost/bmp-status` 镜像，再加载对应架构归档并打 `latest` 标签 |
 | `prebuilt-images/SHA256SUMS` | 归档校验和 |
 
 `bin/` 和 `prebuilt-images/` 只在构建成功后创建，已加入 `.gitignore`。构建

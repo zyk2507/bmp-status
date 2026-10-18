@@ -232,7 +232,7 @@ make cross-images
 # 构建镜像（amd64 + arm64）
 make cross-images
 
-# 目标机器：加载本机架构的镜像并打上 latest 标签
+# 目标机器：强制清理旧的 bmp-status 镜像，再加载本机架构归档并打上 latest 标签
 # （rootful Quadlet 请用 sudo ./prebuilt-images/load.sh）
 ./prebuilt-images/load.sh
 
