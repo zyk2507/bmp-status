@@ -235,6 +235,7 @@ export interface RuntimeConfig {
   maxMessages: number;
   maxRoutes: number;
   maxPeers: number;
+  messageResetSecs: number;
 }
 
 export interface AdminInstancesResponse {

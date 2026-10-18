@@ -39,10 +39,19 @@ export function msgMeta(type: string): MsgMeta {
 }
 
 const grouped = new Intl.NumberFormat("zh-CN");
+const compact = new Intl.NumberFormat("zh-CN", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 export function formatNumber(value: number): string {
   if (!Number.isFinite(value)) return "0";
   return grouped.format(Math.round(value));
+}
+
+export function formatCompact(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  return compact.format(value);
 }
 
 export function formatRate(value: number): string {

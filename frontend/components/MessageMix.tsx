@@ -1,5 +1,5 @@
 import type { AsnCount, Totals } from "@/lib/types";
-import { formatNumber } from "@/lib/format";
+import { formatCompact, formatNumber } from "@/lib/format";
 
 interface Segment {
   label: string;
@@ -53,13 +53,20 @@ export function MessageMix({
   ].filter((segment) => segment.value > 0);
 
   const total = segments.reduce((acc, segment) => acc + segment.value, 0);
+  const totalLabel = formatCompact(total);
+  const totalFontSize = totalLabel.length <= 5 ? 20 : totalLabel.length <= 7 ? 16 : 12;
   let offset = 0;
 
   return (
     <div className="mix-wrap">
       <div className="mix-body">
         <div className="donut-wrap">
-          <svg viewBox="0 0 140 140" className="donut" role="img" aria-label="BMP 消息类型构成">
+          <svg
+            viewBox="0 0 140 140"
+            className="donut"
+            role="img"
+            aria-label={`BMP 消息类型构成，共 ${formatNumber(total)} 条消息`}
+          >
             <circle cx="70" cy="70" r={R} fill="none" stroke="rgba(148,163,184,0.1)" strokeWidth="16" />
             {segments.map((segment) => {
               const length = (segment.value / total) * CIRC;
@@ -82,8 +89,14 @@ export function MessageMix({
               offset += length;
               return circle;
             })}
-            <text x="70" y="68" textAnchor="middle" className="donut-value">
-              {formatNumber(total)}
+            <text
+              x="70"
+              y="68"
+              textAnchor="middle"
+              className="donut-value"
+              style={{ fontSize: totalFontSize }}
+            >
+              {totalLabel}
             </text>
             <text x="70" y="85" textAnchor="middle" className="donut-label">
               条消息

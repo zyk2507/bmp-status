@@ -163,6 +163,7 @@ function AdminView({ onLogout }: { onLogout: () => Promise<void> }) {
     maxMessages: 500,
     maxRoutes: 0,
     maxPeers: 0,
+    messageResetSecs: 86400,
   });
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const runtimeInitialized = useRef(false);
@@ -695,6 +696,23 @@ function AdminView({ onLogout }: { onLogout: () => Promise<void> }) {
                     }
                   />
                   <small>0 = 不限制；淘汰 peer 时会同时清理其路由。</small>
+                </label>
+                <label className="field">
+                  <span>消息计数重置周期（秒）</span>
+                  <input
+                    className="input mono"
+                    type="number"
+                    min={0}
+                    step={3600}
+                    value={runtimeForm.messageResetSecs}
+                    onChange={(event) =>
+                      setRuntimeForm({
+                        ...runtimeForm,
+                        messageResetSecs: Math.max(0, Number(event.target.value) || 0),
+                      })
+                    }
+                  />
+                  <small>86400 = 24 小时；0 = 不重置。只重置顶部消息总数和消息构成，不影响速率、前缀、Peer 会话。</small>
                 </label>
                 <div className="form-actions full">
                   <button className="btn btn-primary btn-sm" type="submit" disabled={runtimeBusy}>

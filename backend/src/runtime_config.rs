@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 const MAX_LIMIT: usize = 10_000_000;
 const DB_FILE: &str = "runtime.sqlite3";
 
+fn default_message_reset_secs() -> usize {
+    86_400
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfig {
@@ -23,6 +27,9 @@ pub struct RuntimeConfig {
     pub max_routes: usize,
     /// 0 means unlimited.
     pub max_peers: usize,
+    /// 0 disables periodic message-counter reset.
+    #[serde(default = "default_message_reset_secs")]
+    pub message_reset_secs: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -31,6 +38,7 @@ impl Default for RuntimeConfig {
             max_messages: 500,
             max_routes: 0,
             max_peers: 0,
+            message_reset_secs: 86_400,
         }
     }
 }
@@ -45,6 +53,9 @@ impl RuntimeConfig {
             if value > MAX_LIMIT {
                 bail!("{name} must be 0 (unlimited) or at most {MAX_LIMIT}");
             }
+        }
+        if self.message_reset_secs > 31_536_000 {
+            bail!("messageResetSecs must be 0 (disabled) or at most 31536000 (one year)");
         }
         Ok(self)
     }
@@ -68,18 +79,33 @@ impl RuntimeConfigStore {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 max_messages INTEGER NOT NULL,
                 max_routes INTEGER NOT NULL,
-                max_peers INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO runtime_config
-                (id, max_messages, max_routes, max_peers)
-                VALUES (1, 500, 0, 0);",
+                max_peers INTEGER NOT NULL,
+                message_reset_secs INTEGER NOT NULL DEFAULT 86400
+            );",
         )
         .with_context(|| format!("failed to initialize SQLite database {}", path.display()))?;
+
+        // Migrate databases created before message_reset_secs existed. This
+        // must run before the INSERT statement references the new column.
+        // The duplicate-column error on fresh databases is intentionally
+        // ignored.
+        let _ = conn.execute(
+            "ALTER TABLE runtime_config
+             ADD COLUMN message_reset_secs INTEGER NOT NULL DEFAULT 86400",
+            [],
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_config
+                (id, max_messages, max_routes, max_peers, message_reset_secs)
+                VALUES (1, 500, 0, 0, 86400)",
+            [],
+        )
+        .with_context(|| format!("failed to seed SQLite database {}", path.display()))?;
 
         let defaults = RuntimeConfig::default();
         let config = conn
             .query_row(
-                "SELECT max_messages, max_routes, max_peers
+                "SELECT max_messages, max_routes, max_peers, message_reset_secs
                  FROM runtime_config WHERE id = 1",
                 [],
                 |row| {
@@ -87,6 +113,7 @@ impl RuntimeConfigStore {
                         max_messages: row.get::<_, i64>(0)?.max(0) as usize,
                         max_routes: row.get::<_, i64>(1)?.max(0) as usize,
                         max_peers: row.get::<_, i64>(2)?.max(0) as usize,
+                        message_reset_secs: row.get::<_, i64>(3)?.max(0) as usize,
                     })
                 },
             )
@@ -110,12 +137,14 @@ impl RuntimeConfigStore {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE runtime_config
-             SET max_messages = ?1, max_routes = ?2, max_peers = ?3
+             SET max_messages = ?1, max_routes = ?2, max_peers = ?3,
+                 message_reset_secs = ?4
              WHERE id = 1",
             params![
                 next.max_messages as i64,
                 next.max_routes as i64,
-                next.max_peers as i64
+                next.max_peers as i64,
+                next.message_reset_secs as i64
             ],
         )
         .context("failed to update runtime config")?;

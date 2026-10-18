@@ -235,6 +235,7 @@ struct Inner {
     string_interner: StringInterner,
     u32_interner: U32Interner,
     community_interner: CommunityInterner,
+    message_reset_at: f64,
     buckets: BTreeMap<u64, BucketCounts>,
     top_origins: AHashMap<u32, u64>,
     instance_activity: HashMap<String, InstanceActivity>,
@@ -266,17 +267,24 @@ impl AppState {
         let (tx, _) = broadcast::channel(2_048);
         let (shutdown_tx, _) = watch::channel(false);
         let limits = runtime.get();
+        let started_at = now_secs();
+        let message_reset_at = if limits.message_reset_secs > 0 {
+            started_at + limits.message_reset_secs as f64
+        } else {
+            0.0
+        };
         Self {
             config,
             admin,
             runtime,
             demo: Mutex::new(None),
             demo_seq: AtomicU64::new(0),
-            started_at: now_secs(),
+            started_at,
             started_instant: Instant::now(),
             overview_seq: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 limits,
+                message_reset_at,
                 ..Inner::default()
             }),
             tx,
@@ -290,9 +298,17 @@ impl AppState {
 
     pub fn update_runtime_config(&self, next: RuntimeConfig) -> anyhow::Result<RuntimeConfig> {
         let next = self.runtime.update(next)?;
+        let now = now_secs();
         let mut inner = self.lock_inner();
         let previous = inner.limits;
         inner.limits = next;
+        if next.message_reset_secs == 0 {
+            inner.message_reset_at = 0.0;
+        } else if previous.message_reset_secs != next.message_reset_secs
+            || inner.message_reset_at <= 0.0
+        {
+            inner.message_reset_at = now + next.message_reset_secs as f64;
+        }
         if next.max_routes == 0 {
             inner.cap_order.clear();
         } else if previous.max_routes == 0 || inner.cap_order.is_empty() {
@@ -458,6 +474,7 @@ impl AppState {
         let now = now_secs();
         let router_ip = addr.ip().to_string();
         let mut inner = self.lock_inner();
+        maybe_reset_message_totals(&mut inner, now);
 
         if let Some(conn) = inner.connections.get_mut(&conn_id) {
             conn.messages += 1;
@@ -515,6 +532,7 @@ impl AppState {
     ) {
         let now = now_secs();
         let mut inner = self.lock_inner();
+        maybe_reset_message_totals(&mut inner, now);
         if let Some(conn) = inner.connections.get_mut(&conn_id) {
             conn.messages += 1;
             conn.bytes += raw_len as u64;
@@ -777,6 +795,7 @@ impl AppState {
         let allowlist_enforced = self.admin.enforce_allowlist();
 
         let mut inner = self.lock_inner();
+        maybe_reset_message_totals(&mut inner, now);
 
         let cutoff = now_sec.saturating_sub(600);
         while let Some(entry) = inner.buckets.first_entry() {
@@ -1183,6 +1202,46 @@ fn rebuild_cap_order(inner: &mut Inner) {
             .iter()
             .map(|(key, record)| (record.first_seq, key.clone())),
     );
+}
+
+fn reset_message_totals(inner: &mut Inner) {
+    // Only reset the global message counters. Rate buckets, active routes,
+    // peer sessions, instance state and connection totals are intentionally
+    // left untouched.
+    inner.totals.messages = 0;
+    inner.totals.route_monitoring = 0;
+    inner.totals.statistics_report = 0;
+    inner.totals.peer_up = 0;
+    inner.totals.peer_down = 0;
+    inner.totals.initiation = 0;
+    inner.totals.termination = 0;
+    inner.totals.route_mirroring = 0;
+    inner.totals.announcements = 0;
+    inner.totals.withdrawals = 0;
+    inner.totals.parse_errors = 0;
+    inner.totals.bytes = 0;
+}
+
+fn maybe_reset_message_totals(inner: &mut Inner, now: f64) {
+    let reset_secs = inner.limits.message_reset_secs;
+    if reset_secs == 0 {
+        inner.message_reset_at = 0.0;
+        return;
+    }
+    if inner.message_reset_at <= 0.0 {
+        inner.message_reset_at = now + reset_secs as f64;
+        return;
+    }
+    if now < inner.message_reset_at {
+        return;
+    }
+
+    reset_message_totals(inner);
+    // Skip missed periods so a suspended/slow process does not spend time
+    // repeatedly resetting in a loop.
+    let elapsed = (now - inner.message_reset_at).max(0.0);
+    let periods = (elapsed / reset_secs as f64).floor() as u64 + 1;
+    inner.message_reset_at += periods as f64 * reset_secs as f64;
 }
 
 fn trim_state(inner: &mut Inner) {
